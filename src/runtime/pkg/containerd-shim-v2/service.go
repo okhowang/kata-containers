@@ -929,11 +929,25 @@ func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (_ *em
 		hostIO = execs.ttyio
 	}
 
+	// Complete a pending host stdin FIFO open before waiting for the copier,
+	// otherwise CloseIO can block forever while holding the service mutex.
+	// A failure here only means the reader will never become usable, so it
+	// must not abort the request: the caller asked for stdin to be closed and
+	// skipping stdin.Close() would leave the guest process waiting for an EOF
+	// that never arrives.
 	if hostIO != nil {
 		if pi, ok := hostIO.io.(*pipeIO); ok {
 			if stdinFIFO, ok := pi.in.(*stdinFIFO); ok {
 				if err := stdinFIFO.finishOpen(); err != nil {
-					return nil, errors.Wrap(err, "finish stdin FIFO open")
+					shimLog.WithFields(logrus.Fields{
+						"container": r.ID,
+						"exec-id":   r.ExecID,
+					}).WithError(err).Warn("failed to finish stdin FIFO open")
+					// Make sure a still-pending open is always released, otherwise the
+					// <-stdinCloser below blocks forever while holding s.mu.
+					if cerr := stdinFIFO.Close(); cerr != nil {
+						shimLog.WithError(cerr).Warn("failed to close stdin FIFO")
+					}
 				}
 			}
 		}
